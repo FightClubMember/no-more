@@ -151,29 +151,33 @@ class Database:
             else:
                 return self.conn.execute(sql, params or ())
     
-    def _fetchone(self, sql: str, params: tuple = None) -> Optional[any]:
+    def _fetchone(self, sql: str, params: tuple = None) -> Optional[dict]:
         with self.lock:
             if self.is_postgres:
                 try:
                     with self._execute(sql, params) as cur:
-                        return cur.fetchone()
+                        row = cur.fetchone()
+                        return dict(row) if row else None
                 except Exception as e:
                     logging.error(f"PostgreSQL fetchone error: {e}")
                     return None
             else:
-                return self._execute(sql, params).fetchone()
+                row = self._execute(sql, params).fetchone()
+                return dict(row) if row else None
     
-    def _fetchall(self, sql: str, params: tuple = None) -> List[any]:
+    def _fetchall(self, sql: str, params: tuple = None) -> List[dict]:
         with self.lock:
             if self.is_postgres:
                 try:
                     with self._execute(sql, params) as cur:
-                        return cur.fetchall()
+                        rows = cur.fetchall()
+                        return [dict(row) for row in rows] if rows else []
                 except Exception as e:
                     logging.error(f"PostgreSQL fetchall error: {e}")
                     return []
             else:
-                return self._execute(sql, params).fetchall()
+                rows = self._execute(sql, params).fetchall()
+                return [dict(row) for row in rows] if rows else []
 
     def _migrate(self):
         """Create all tables and run migrations."""
@@ -1471,7 +1475,7 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 {user['first_name']}\n"
         f"🆔 `{user_id}`\n"
         f"📧 `{user.get('email', 'N/A')}`\n"
-        f"📅 Joined: {user['joined_at'][:10]}\n\n"
+        f"📅 Joined: {str(user['joined_at'])[:10]}\n\n"
         f"💰 Credits: {user['credits']}\n"
         f"📈 Earned: {user['total_earned']}\n"
         f"👥 Referrals: {ref_stats['count']}\n"
@@ -1759,7 +1763,7 @@ async def admin_listpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     body = ""
     for p in passes[:20]:
-        expiry = f"Exp: {p['expires_at'][:10]}" if p['expires_at'] else "No expiry"
+        expiry = f"Exp: {str(p['expires_at'])[:10]}" if p['expires_at'] else "No expiry"
         body += f"🔑 `{p['code']}` - `{p['credits']}cr` | `{p['uses_left']}/{p['max_uses']}` | {expiry}\n\n"
     
     await update.message.reply_text(
@@ -1792,13 +1796,13 @@ async def admin_passinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Pass not found.")
         return
     
-    expiry = f"Expires: {info['expires_at'][:10]}" if info['expires_at'] else "No expiry"
+    expiry = f"Expires: {str(info['expires_at'])[:10]}" if info['expires_at'] else "No expiry"
     body = (
         f"🔑 Code: `{info['code']}`\n"
         f"💰 Credits: `{info['credits']}`\n"
         f"🔄 Uses: `{info['uses_left']}/{info['max_uses']}`\n"
         f"⏰ {expiry}\n"
-        f"📅 Created: `{info['created_at'][:10]}`"
+        f"📅 Created: `{str(info['created_at'])[:10]}`"
     )
     await update.message.reply_text(
         UI.box("Pass Info", body),
@@ -2012,7 +2016,7 @@ async def admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'broadcast': '📡', 'create_pass': '🔑'
         }.get(log['action'], '🔹')
         
-        body += f"{action_emoji} `{log['action']}` - `{log['target']}`\n   👤 {log['admin_name'] or log['admin_id']} | 🕐 {log['created_at'][:16]}\n\n"
+        body += f"{action_emoji} `{log['action']}` - `{log['target']}`\n   👤 {log['admin_name'] or log['admin_id']} | 🕐 {str(log['created_at'])[:16]}\n\n"
     
     await update.message.reply_text(
         UI.box("Admin Logs", body),
