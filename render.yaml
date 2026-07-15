@@ -11,3 +11,5 @@ services:
         sync: true # Prompts you for the token during setup
       - key: ADMIN_IDS
         sync: true # Prompts you for your admin IDs during setup
+      - key: DATABASE_URL
+        sync: true # Prompts you for your Neon connection string during setup
