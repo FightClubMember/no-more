@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: temp-mail-telegram-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: BOT_TOKEN
+        sync: true # Prompts you for the token during setup
+      - key: ADMIN_IDS
+        sync: true # Prompts you for your admin IDs during setup

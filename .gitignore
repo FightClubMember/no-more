@@ -1,0 +1,18 @@
+# Environments and Virtualenvs
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
