@@ -83,6 +83,16 @@ class MockCursor:
         pass
 
 
+class PostgresConnectionWrapper:
+    """Wrapper around psycopg2 connection to intercept commit and make it a no-op."""
+    def __init__(self, conn):
+        self._conn = conn
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+    def commit(self):
+        pass
+
+
 class Database:
     """Complete database layer supporting SQLite and PostgreSQL dynamically, with thread safety."""
     
@@ -106,9 +116,9 @@ class Database:
         import psycopg2.extras
         try:
             if self.conn is None or self.conn.closed:
-                self.conn = psycopg2.connect(self.db_url, cursor_factory=psycopg2.extras.DictCursor)
-                self.conn.autocommit = True
-                self.conn.commit = lambda: None
+                pg_conn = psycopg2.connect(self.db_url, cursor_factory=psycopg2.extras.DictCursor)
+                pg_conn.autocommit = True
+                self.conn = PostgresConnectionWrapper(pg_conn)
         except Exception as e:
             logging.error(f"Error connecting to PostgreSQL: {e}")
             raise e
