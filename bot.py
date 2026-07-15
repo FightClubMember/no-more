@@ -731,7 +731,10 @@ class Database:
         
         # Check expiry
         if pass_info['expires_at']:
-            expires = datetime.strptime(pass_info['expires_at'], "%Y-%m-%d %H:%M:%S")
+            if isinstance(pass_info['expires_at'], datetime):
+                expires = pass_info['expires_at']
+            else:
+                expires = datetime.strptime(str(pass_info['expires_at']), "%Y-%m-%d %H:%M:%S")
             if expires < datetime.now():
                 return False, "This pass has expired."
         
@@ -899,12 +902,13 @@ class UI:
     
     @staticmethod
     def get_reply_keyboard() -> ReplyKeyboardMarkup:
-        """Get the persistent reply keyboard."""
+        """Get the persistent reply keyboard with Redeem Key button."""
         keyboard = [
             [KeyboardButton("📥 INBOX"), KeyboardButton("🆕 NEW EMAIL")],
             [KeyboardButton("📅 DAILY CHECK-IN"), KeyboardButton("💰 BALANCE")],
-            [KeyboardButton("👥 REFERRALS"), KeyboardButton("📊 MY STATS")],
-            [KeyboardButton("🏆 LEADERBOARD"), KeyboardButton("❓ HELP")],
+            [KeyboardButton("👥 REFERRALS"), KeyboardButton("🔑 REDEEM KEY")],
+            [KeyboardButton("🏆 LEADERBOARD"), KeyboardButton("📊 MY STATS")],
+            [KeyboardButton("❓ HELP")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -999,15 +1003,18 @@ class GmailService:
                 mail.login(gmail_user, gmail_pass)
                 mail.select("inbox")
                 
-                status, messages = mail.search(None, f'TO "{email_addr}"')
-                if status != "OK":
+                # Fetch recent messages (e.g. search ALL and take the last 30)
+                status, messages = mail.search(None, 'ALL')
+                if status != "OK" or not messages[0]:
+                    mail.logout()
                     return []
                     
                 mail_ids = messages[0].split()
-                mail_ids = mail_ids[-15:]
+                # Take the last 30 messages
+                recent_ids = mail_ids[-30:]
                 
                 result = []
-                for mail_id in reversed(mail_ids):
+                for mail_id in reversed(recent_ids):
                     status, data = mail.fetch(mail_id, "(RFC822)")
                     if status != "OK":
                         continue
@@ -1015,6 +1022,13 @@ class GmailService:
                     raw_email = data[0][1]
                     msg = email.message_from_bytes(raw_email)
                     
+                    # Check if the TO or CC headers match our target sub-address
+                    to_header = str(msg["To"] or "").lower()
+                    cc_header = str(msg["Cc"] or "").lower()
+                    target = email_addr.lower()
+                    if target not in to_header and target not in cc_header:
+                        continue
+                        
                     subject, encoding = decode_header(msg["Subject"] or "No Subject")[0]
                     if isinstance(subject, bytes):
                         subject = subject.decode(encoding or "utf-8", errors="ignore")
@@ -1355,6 +1369,19 @@ async def new_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if user['is_banned']:
         await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
+        return
+        
+    # Block and guide if Gmail is not configured
+    if not GmailService.is_configured():
+        guide = (
+            "⚠️ <b>Gmail Master Account Not Configured!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "To generate premium <b>@gmail.com</b> temporary emails, the bot administrator must configure the master credentials in Render's environment variables:\n\n"
+            "1️⃣ <b>GMAIL_USER</b> ➔ Your master Gmail address (e.g. <code>mymailbox@gmail.com</code>)\n"
+            "2️⃣ <b>GMAIL_APP_PASSWORD</b> ➔ 16-character Google App Password\n\n"
+            "💡 <i>Once added on Render, this command will instantly create high-speed Gmail addresses!</i>"
+        )
+        await update.message.reply_text(UI.box("Setup Needed", guide), parse_mode=ParseMode.HTML)
         return
     
     # Check credits
@@ -1732,10 +1759,27 @@ async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # REPLY KEYBOARD HANDLER
 # ================================================================================
 
+async def redeem_btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start redeeming process from reply keyboard."""
+    context.user_data['awaiting_redeem'] = True
+    await update.message.reply_text(
+        "🔑 <b>Please enter the pass code you want to redeem:</b>",
+        parse_mode=ParseMode.HTML
+    )
+
+
 async def reply_keyboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle reply keyboard button presses."""
     text = update.message.text.strip()
     
+    # Check if user is awaiting pass redeem code
+    if context.user_data.get('awaiting_redeem'):
+        context.user_data['awaiting_redeem'] = False
+        code = text.upper()
+        success, message = db.redeem_pass(code, update.effective_user.id)
+        await update.message.reply_text(f"🔑 <b>Redeem Pass:</b>\n\n{message}", parse_mode=ParseMode.HTML)
+        return
+
     command_map = {
         "INBOX": inbox_command,
         "DAILY CHECK-IN": daily_command,
@@ -1745,10 +1789,11 @@ async def reply_keyboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         "LEADERBOARD": leaderboard_command,
         "HELP": help_command,
         "NEW EMAIL": new_email_command,
+        "REDEEM KEY": redeem_btn_handler,
     }
     
     # Strip emoji prefixes for matching
-    for prefix in ["📥 ", "📅 ", "👥 ", "💰 ", "📊 ", "🏆 ", "❓ ", "🆕 "]:
+    for prefix in ["📥 ", "📅 ", "👥 ", "💰 ", "📊 ", "🏆 ", "❓ ", "🆕 ", "🔑 "]:
         if text.startswith(prefix):
             text = text[len(prefix):]
             break
@@ -1779,6 +1824,39 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(user_id)
     if user and user['is_banned']:
         await query.edit_message_text("You are banned from using this bot.")
+        return
+        
+    # Admin Panel callback routing
+    if data.startswith("admin_"):
+        if user_id not in ADMIN_IDS:
+            await query.edit_message_text("Access denied. Admin only.")
+            return
+            
+        action = data.split("_")[1]
+        
+        if action == "menu":
+            await _show_admin_menu(query)
+        elif action == "passes":
+            await _show_admin_passes(query)
+        elif action == "listpass":
+            await _show_admin_listpass(query)
+        elif action == "channels":
+            await _show_admin_channels(query)
+        elif action == "listchannels":
+            await _show_admin_listchannels(query)
+        elif action == "users":
+            await _show_admin_users(query)
+        elif action == "stats":
+            await _show_admin_stats(query)
+        elif action == "logs":
+            await _show_admin_logs(query)
+        elif action == "broadcast":
+            await _show_admin_broadcast(query)
+        elif action == "close":
+            try:
+                await query.delete_message()
+            except:
+                pass
         return
     
     # Inbox pagination
@@ -1824,31 +1902,261 @@ async def _display_inbox_page(query, context, user_id: int, page: int):
     start = page * MESSAGES_PER_PAGE
     end = start + MESSAGES_PER_PAGE
     page_messages = messages[start:end]
+    body = f"📧 <b>Mailbox:</b> <code>{email}</code>\n"
+    body += "━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    for msg_data in page_messages:
+        mid = msg_data.get('messageID', '?')
+        subject = msg_data.get('subject', msg_data.get('from', 'No Subject'))
+        from_addr = msg_data.get('from', 'Unknown')
+        
+        seen = db.is_message_seen(user_id, mid)
+        icon = "✉️" if not seen else "📖"
+        
+        body += (
+            f"{icon} <b>Subject:</b> {html.escape(subject[:40])}\n"
+            f"👤 <b>From:</b> {html.escape(from_addr[:40])}\n"
+            f"🔗 <b>Open Message:</b> /read_{mid}\n\n"
+        )
+    
+    body += f"📖 <b>Page {page + 1} of {total_pages}</b> | {len(messages)} total messages"
+    
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"inbox_{page - 1}"))
+    if page < total_pages - 1:
+        buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"inbox_{page + 1}"))
+        
+    reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
+    
+    await query.edit_message_text(
+        UI.box("Your Inbox", body),
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup
+    )
+
+
+# ================================================================================
+# INTERACTIVE ADMIN PANEL SUITE
+# ================================================================================
+
+async def _send_admin_menu_content():
+    body = (
+        "⚙️ <b>ADMIN OPERATIONS PANEL</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "Welcome, Admin! Select a category below to perform system management:"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔑 Pass Manager", callback_data="admin_passes"),
+            InlineKeyboardButton("📢 Force Join Lock", callback_data="admin_channels")
+        ],
+        [
+            InlineKeyboardButton("👤 User Moderator", callback_data="admin_users"),
+            InlineKeyboardButton("📊 System Stats", callback_data="admin_stats")
+        ],
+        [
+            InlineKeyboardButton("📑 Audit Logs", callback_data="admin_logs"),
+            InlineKeyboardButton("📡 Broadcast Alert", callback_data="admin_broadcast")
+        ],
+        [
+            InlineKeyboardButton("❌ Close Panel", callback_data="admin_close")
+        ]
+    ])
+    return UI.box("Admin Console", body), keyboard
+
+
+async def _show_admin_menu(query):
+    text, reply_markup = await _send_admin_menu_content()
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+
+
+async def _show_admin_passes(query):
+    body = (
+        "🔑 <b>PASS MANAGER</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "To manage passes, use these commands in chat:\n"
+        "• <code>/createpass &lt;cr&gt; [uses=1] [days=0]</code>\n"
+        "• <code>/delpass &lt;code&gt;</code>\n"
+        "• <code>/passinfo &lt;code&gt;</code>"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 List Active Passes", callback_data="admin_listpass")],
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="admin_menu")]
+    ])
+    await query.edit_message_text(
+        UI.box("Pass Manager", body),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
+
+async def _show_admin_listpass(query):
+    passes = db.list_passes()
+    if not passes:
+        body = "📋 <b>No active passes created yet.</b>"
+    else:
+        body = "📋 <b>ACTIVE PASSES (LATEST 20)</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for p in passes[:20]:
+            expiry = f"Exp: {str(p['expires_at'])[:10]}" if p['expires_at'] else "No expiry"
+            body += f"🔑 <code>{p['code']}</code>\n💰 <code>{p['credits']} cr</code> | 🔄 <code>{p['uses_left']}/{p['max_uses']}</code> | ⏰ {expiry}\n\n"
+            
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back to Pass Manager", callback_data="admin_passes")]
+    ])
+    await query.edit_message_text(
+        UI.box("Pass List", body),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
+
+async def _show_admin_channels(query):
+    body = (
+        "📢 <b>FORCE JOIN CHANNELS</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "To manage lock channels, use these commands in chat:\n"
+        "• <code>/addchannel &lt;@username&gt;</code>\n"
+        "• <code>/removechannel &lt;@username&gt;</code>"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 List Locked Channels", callback_data="admin_listchannels")],
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="admin_menu")]
+    ])
+    await query.edit_message_text(
+        UI.box("Force Join Lock", body),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
+
+async def _show_admin_listchannels(query):
+    channels = db.list_force_channels()
+    if not channels:
+        body = "⚠️ <b>No force join channels configured.</b>"
+    else:
+        body = ""
+        active_count = 0
+        for ch in channels:
+            status = "🟢 Active" if ch['is_active'] else "🔴 Inactive"
+            if ch['is_active']:
+                active_count += 1
+            body += f"📢 <code>{ch['channel_id']}</code> - {status}\n📅 Added: <code>{str(ch['added_at'])[:10]}</code>\n\n"
+        body = f"👥 <b>Active:</b> <code>{active_count}</code> | <b>Total:</b> <code>{len(channels)}</code>\n━━━━━━━━━━━━━━━━━━━━━\n\n" + body
+        
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back to Channel Lock", callback_data="admin_channels")]
+    ])
+    await query.edit_message_text(
+        UI.box("Force Channels", body),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
+
+async def _show_admin_users(query):
+    body = (
+        "👤 <b>USER MODERATION PANEL</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "Perform user management by typing these commands in chat:\n"
+        "• <code>/ban &lt;user_id&gt;</code>\n"
+        "• <code>/unban &lt;user_id&gt;</code>\n"
+        "• <code>/userinfo &lt;user_id&gt;</code>"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="admin_menu")]
+    ])
+    await query.edit_message_text(
+        UI.box("User Moderator", body),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
+
+async def _show_admin_stats(query):
+    stats = db.get_stats()
+    body = (
+        f"👥 <b>USER BASE METRICS</b>\n"
+        f"• <b>Total Registered:</b> <code>{stats['total_users']} users</code>\n"
+        f"• <b>Active Today:</b> <code>{stats['active_today']} users</code>\n\n"
+        f"📨 <b>BOT ACTIVITY STATS</b>\n"
+        f"• <b>Emails Generated:</b> <code>{stats['total_emails']} addresses</code>\n"
+        f"• <b>Check-ins Claimed:</b> <code>{stats['total_checkins']} daily</code>\n"
+        f"• <b>Successful Referrals:</b> <code>{stats['total_referrals']} signups</code>\n\n"
+        f"🔑 <b>CREDIT KEY SYSTEM</b>\n"
+        f"• <b>Keys Created:</b> <code>{stats['total_passes_created']} keys</code>\n"
+        f"• <b>Keys Redeemed:</b> <code>{stats['total_pass_redemptions']} keys</code>\n"
+        f"• <b>Unredeemed Active:</b> <code>{stats['total_passes']} keys</code>\n\n"
+        f"⚙️ <b>SYSTEM CONFIG</b>\n"
+        f"• <b>Locked Channels:</b> <code>{stats['total_force_channels']} channels</code>\n"
+        f"• <b>Total Bans Enforced:</b> <code>{stats['total_bans']} users</code>\n"
+        f"• <b>Total Broadcasts:</b> <code>{stats['total_broadcasts']} alerts</code>"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh Stats", callback_data="admin_stats"),
+            InlineKeyboardButton("🔙 Back to Main Menu", callback_data="admin_menu")
+        ]
+    ])
+    await query.edit_message_text(
+        UI.box("Bot Statistics", body),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
+
+async def _show_admin_logs(query):
+    logs = db.get_admin_logs(30)
+    if not logs:
+        body = "⚠️ <b>No admin logs found.</b>"
+    else:
+        body = ""
+        for log in logs[:20]:
+            action_emoji = {
+                'ban': '🔨', 'unban': '✅', 'force_join_add': '📢', 'force_join_remove': '🗑️',
+                'broadcast': '📡', 'create_pass': '🔑'
+            }.get(log['action'], '🔹')
+            body += f"{action_emoji} <b>{log['action'].upper()}</b> ➔ <code>{log['target']}</code>\n👤 Admin: <code>{html.escape(log['admin_name'] or str(log['admin_id']))}</code> | 🕐 {str(log['created_at'])[:16]}\n\n"
+            
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh Logs", callback_data="admin_logs"),
+            InlineKeyboardButton("🔙 Back to Main Menu", callback_data="admin_menu")
+        ]
+    ])
+    await query.edit_message_text(
+        UI.box("Admin Logs", body),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
+
+async def _show_admin_broadcast(query):
+    body = (
+        "📡 <b>BROADCAST ALERT SYSTEM</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "To broadcast an announcement, type this command in chat:\n"
+        "<code>/broadcast &lt;message&gt;</code>\n\n"
+        "<i>Note: You can use HTML formatting tags like &lt;b&gt;bold&lt;/b&gt; and &lt;code&gt;code&lt;/code&gt;!</i>"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="admin_menu")]
+    ])
+    await query.edit_message_text(
+        UI.box("Broadcast System", body),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
+
+@admin_only
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Open admin panel."""
-    body = (
-        "🔑 <b>PASS / KEY SYSTEM</b>\n"
-        "• <code>/createpass &lt;credits&gt; [uses=1] [days=0]</code>\n"
-        "• <code>/listpass</code> - List recent passcodes\n"
-        "• <code>/delpass &lt;code&gt;</code> - Delete a passcode\n"
-        "• <code>/passinfo &lt;code&gt;</code> - View passcode usage\n\n"
-        "📢 <b>FORCE JOIN MANAGEMENT</b>\n"
-        "• <code>/addchannel &lt;@username&gt;</code> - Add channel lock\n"
-        "• <code>/removechannel &lt;@username&gt;</code> - Remove channel lock\n"
-        "• <code>/listchannels</code> - List locked channels\n\n"
-        "👤 <b>USER MODERATION</b>\n"
-        "• <code>/ban &lt;user_id&gt;</code> - Ban user from bot\n"
-        "• <code>/unban &lt;user_id&gt;</code> - Lift user ban\n"
-        "• <code>/userinfo &lt;user_id&gt;</code> - Fetch user database record\n\n"
-        "📊 <b>BOT MONITORING</b>\n"
-        "• <code>/stats</code> - Global bot metrics\n"
-        "• <code>/adminlogs</code> - Admin action audit trail\n\n"
-        "📡 <b>ANNOUNCEMENT</b>\n"
-        "• <code>/broadcast &lt;message&gt;</code> - Broadcast HTML alert to all"
-    )
+    text, reply_markup = await _send_admin_menu_content()
     await update.message.reply_text(
-        UI.box("Admin Operations Console", body),
-        parse_mode=ParseMode.HTML
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup
     )
 
 
