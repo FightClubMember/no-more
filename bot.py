@@ -22,6 +22,10 @@ import json
 import html
 import http.server
 import socketserver
+import asyncio
+import imaplib
+import email
+from email.header import decode_header
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple, Union
 from collections import defaultdict
@@ -874,18 +878,23 @@ class Database:
 # ================================================================================
 
 class UI:
-    """Unified UI helpers for consistent message formatting."""
+    """Unified UI helpers for consistent message formatting using HTML."""
     
     @staticmethod
     def box(title: str, body: str) -> str:
-        """Create a boxed message with title and body."""
-        return f"{title}\n\n{body}"
+        """Create a boxed message with title and body using premium ASCII headers."""
+        header = (
+            f"<b>╔═════════════════════════════════╗</b>\n"
+            f"   ⚡️ <b>{title.upper()}</b>\n"
+            f"<b>╚═════════════════════════════════╝</b>"
+        )
+        return f"{header}\n\n{body}"
     
     @staticmethod
     def back_button(callback_data: str = "noop") -> InlineKeyboardMarkup:
         """Create a back button."""
         return InlineKeyboardMarkup([[
-            InlineKeyboardButton("Back", callback_data=callback_data)
+            InlineKeyboardButton("🔙 Back to Menu", callback_data=callback_data)
         ]])
     
     @staticmethod
@@ -959,7 +968,124 @@ db = Database()
 # EMAIL SERVICE (Emailnator API)
 # ================================================================================
 
-class EmailService:
+class GmailService:
+    """Custom Gmail IMAP service for dot/plus sub-addressing temporary mail."""
+    
+    @staticmethod
+    def is_configured() -> bool:
+        return bool(os.environ.get("GMAIL_USER") and os.environ.get("GMAIL_APP_PASSWORD"))
+        
+    @staticmethod
+    def generate_email(user_id: int) -> str:
+        """Generate a unique Gmail plus-variant based on the master account."""
+        gmail_user = os.environ.get("GMAIL_USER")
+        if not gmail_user or "@" not in gmail_user:
+            return ""
+        username, domain = gmail_user.split("@", 1)
+        random_tag = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        return f"{username}+{user_id}_{random_tag}@{domain}"
+
+    @staticmethod
+    async def get_messages(user_id: int, email_addr: str) -> Optional[List[dict]]:
+        """Fetch emails from Gmail IMAP folder matching the sub-address."""
+        gmail_user = os.environ.get("GMAIL_USER")
+        gmail_pass = os.environ.get("GMAIL_APP_PASSWORD")
+        if not gmail_user or not gmail_pass:
+            return None
+            
+        def _fetch():
+            try:
+                mail = imaplib.IMAP4_SSL("imap.gmail.com")
+                mail.login(gmail_user, gmail_pass)
+                mail.select("inbox")
+                
+                status, messages = mail.search(None, f'TO "{email_addr}"')
+                if status != "OK":
+                    return []
+                    
+                mail_ids = messages[0].split()
+                mail_ids = mail_ids[-15:]
+                
+                result = []
+                for mail_id in reversed(mail_ids):
+                    status, data = mail.fetch(mail_id, "(RFC822)")
+                    if status != "OK":
+                        continue
+                        
+                    raw_email = data[0][1]
+                    msg = email.message_from_bytes(raw_email)
+                    
+                    subject, encoding = decode_header(msg["Subject"] or "No Subject")[0]
+                    if isinstance(subject, bytes):
+                        subject = subject.decode(encoding or "utf-8", errors="ignore")
+                        
+                    from_, encoding = decode_header(msg["From"] or "Unknown")[0]
+                    if isinstance(from_, bytes):
+                        from_ = from_.decode(encoding or "utf-8", errors="ignore")
+                        
+                    result.append({
+                        "messageID": mail_id.decode(),
+                        "subject": subject,
+                        "from": from_,
+                        "date": msg["Date"] or ""
+                    })
+                    
+                mail.logout()
+                return result
+            except Exception as e:
+                logging.error(f"Gmail IMAP fetch error: {e}")
+                return None
+                
+        return await asyncio.to_thread(_fetch)
+
+    @staticmethod
+    async def get_message_content(user_id: int, email_addr: str, message_id: str) -> Optional[str]:
+        """Fetch body of specific IMAP message."""
+        gmail_user = os.environ.get("GMAIL_USER")
+        gmail_pass = os.environ.get("GMAIL_APP_PASSWORD")
+        if not gmail_user or not gmail_pass:
+            return None
+            
+        def _fetch_body():
+            try:
+                mail = imaplib.IMAP4_SSL("imap.gmail.com")
+                mail.login(gmail_user, gmail_pass)
+                mail.select("inbox")
+                
+                status, data = mail.fetch(message_id, "(RFC822)")
+                if status != "OK":
+                    return None
+                    
+                raw_email = data[0][1]
+                msg = email.message_from_bytes(raw_email)
+                
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        content_type = part.get_content_type()
+                        content_disposition = str(part.get("Content-Disposition"))
+                        
+                        if content_type == "text/plain" and "attachment" not in content_disposition:
+                            payload = part.get_payload(decode=True)
+                            body = payload.decode(part.get_content_charset() or "utf-8", errors="ignore")
+                            break
+                        elif content_type == "text/html" and "attachment" not in content_disposition:
+                            payload = part.get_payload(decode=True)
+                            body = payload.decode(part.get_content_charset() or "utf-8", errors="ignore")
+                else:
+                    payload = msg.get_payload(decode=True)
+                    body = payload.decode(msg.get_content_charset() or "utf-8", errors="ignore")
+                    
+                mail.logout()
+                return body or "No content"
+            except Exception as e:
+                logging.error(f"Gmail IMAP fetch body error: {e}")
+                return None
+                
+        return await asyncio.to_thread(_fetch_body)
+
+
+class MailTmService:
     """Mail.tm API service for generating and checking temporary emails."""
     
     @staticmethod
@@ -968,7 +1094,7 @@ class EmailService:
     
     @staticmethod
     async def get_token(user_id: int, email: str) -> Optional[str]:
-        password = EmailService._get_password(user_id)
+        password = MailTmService._get_password(user_id)
         async with httpx.AsyncClient(timeout=15) as client:
             try:
                 resp = await client.post(
@@ -1002,7 +1128,7 @@ class EmailService:
                 
                 username = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
                 email = f"{username}@{domain}"
-                password = EmailService._get_password(user_id)
+                password = MailTmService._get_password(user_id)
                 
                 resp_create = await client.post(
                     f"{MAIL_TM_BASE_URL}/accounts",
@@ -1020,7 +1146,7 @@ class EmailService:
     @staticmethod
     async def get_messages(user_id: int, email: str) -> Optional[List[dict]]:
         """Get messages for an email address."""
-        token = await EmailService.get_token(user_id, email)
+        token = await MailTmService.get_token(user_id, email)
         if not token:
             return None
             
@@ -1052,7 +1178,7 @@ class EmailService:
     @staticmethod
     async def get_message_content(user_id: int, email: str, message_id: str) -> Optional[str]:
         """Get full content of a specific message."""
-        token = await EmailService.get_token(user_id, email)
+        token = await MailTmService.get_token(user_id, email)
         if not token:
             return None
             
@@ -1067,6 +1193,31 @@ class EmailService:
             except Exception as e:
                 logging.error(f"Get message content error: {e}")
                 return None
+
+
+class EmailService:
+    """Unified API service selecting between Gmail IMAP and Mail.tm dynamically."""
+    
+    @staticmethod
+    async def generate_email(user_id: int) -> Optional[str]:
+        if GmailService.is_configured():
+            return GmailService.generate_email(user_id)
+        else:
+            return await MailTmService.generate_email(user_id)
+            
+    @staticmethod
+    async def get_messages(user_id: int, email: str) -> Optional[List[dict]]:
+        if GmailService.is_configured() and "@gmail.com" in email:
+            return await GmailService.get_messages(user_id, email)
+        else:
+            return await MailTmService.get_messages(user_id, email)
+            
+    @staticmethod
+    async def get_message_content(user_id: int, email: str, message_id: str) -> Optional[str]:
+        if GmailService.is_configured() and "@gmail.com" in email:
+            return await GmailService.get_message_content(user_id, email, message_id)
+        else:
+            return await MailTmService.get_message_content(user_id, email, message_id)
 
 
 # ================================================================================
@@ -1126,7 +1277,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if banned first
     user = db.get_user(user_id)
     if user and user['is_banned']:
-        await update.message.reply_text("You are banned from using this bot.")
+        await update.message.reply_text("⛔️ <b>You are banned from using this bot.</b>", parse_mode=ParseMode.HTML)
         return
     
     # Register or update
@@ -1138,32 +1289,33 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not passed:
         await update.message.reply_text(
             UI.box("Join Required", msg),
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.HTML
         )
         return
     
     # Welcome message
-    body = f"Welcome, {first_name}! 🎉\n\n"
+    body = f"👋 Welcome, <b>{html.escape(first_name)}</b>! 🎉\n"
+    body += "━━━━━━━━━━━━━━━━━━━━━\n"
     if is_new:
-        body += f"✨ +{WELCOME_BONUS} credits as welcome bonus!\n"
+        body += f"✨ <code>+{WELCOME_BONUS} credits</code> welcome bonus added!\n"
         if referred_by:
-            body += "🎁 Referral bonus applied!\n"
+            body += "🎁 Referral bonus applied successfully!\n"
     else:
-        body += "Welcome back!\n"
+        body += "✨ Welcome back to the ultimate mail dashboard!\n"
     
     email = user.get('email', '')
     if email:
-        body += f"\n📧 Your email: `{email}`\n"
+        body += f"\n📧 <b>Your Address:</b>\n<code>{email}</code>\n"
     else:
-        body += "\n📧 Use /newemail to generate an email.\n"
+        body += "\n📧 <i>You don't have an email address yet.</i>\n👉 Tap <b>NEW EMAIL</b> to generate one.\n"
     
-    body += f"\n💰 Balance: `{user['credits']} credits`\n"
-    body += f"🔗 Referral: `ref_{ref_code}`\n\n"
-    body += "Use the buttons below or type /help for commands."
+    body += f"\n💰 <b>Balance:</b> <code>{user['credits']} credits</code>\n"
+    body += f"🔗 <b>Referral Code:</b> <code>ref_{ref_code}</code>\n\n"
+    body += "📱 Use the reply menu below or send /help to list all commands."
     
     await update.message.reply_text(
         UI.box("Temp Mail Bot", body),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
         reply_markup=UI.get_reply_keyboard()
     )
 
@@ -1171,24 +1323,23 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command."""
     body = (
-        "📧 *Email:*\n"
-        "• /inbox - Check your inbox\n"
-        "• /newemail - Generate a new email\n"
-        "• /read_<id> - Read a specific message\n\n"
-        "💰 *Economy:*\n"
-        "• /daily - Daily check-in bonus\n"
-        "• /referral - Get your referral link\n"
-        "• /redeem - Redeem a pass code\n"
-        "• /balance - Check your credits\n\n"
-        "📊 *Info:*\n"
-        "• /mystats - Your statistics\n"
-        "• /leaderboard - Top users leaderboard\n"
-        "• /start - Restart the bot\n"
-        "• /help - This menu"
+        "📌 <b>EMAIL MANAGEMENT</b>\n"
+        "• /newemail - Generate a new temporary address\n"
+        "• /inbox - Read incoming messages\n"
+        "• /read_&lt;id&gt; - Open specific email\n\n"
+        "💰 <b>ECONOMY & CREDITS</b>\n"
+        "• /daily - Daily check-in rewards\n"
+        "• /referral - View referral stats & link\n"
+        "• /redeem - Use a pass/key code\n"
+        "• /balance - Quick wallet check\n\n"
+        "📊 <b>INFORMATION</b>\n"
+        "• /mystats - Detailed account logs\n"
+        "• /leaderboard - Top users ranking\n"
+        "• /help - Display this manual"
     )
     await update.message.reply_text(
-        UI.box("Help", body),
-        parse_mode=ParseMode.MARKDOWN,
+        UI.box("Bot Commands Help", body),
+        parse_mode=ParseMode.HTML,
         reply_markup=UI.get_reply_keyboard()
     )
 
@@ -1199,40 +1350,48 @@ async def new_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(user_id)
     
     if not user:
-        await update.message.reply_text("Please use /start first to register.")
+        await update.message.reply_text("⚠️ Please use /start first to register.", parse_mode=ParseMode.HTML)
         return
     
     if user['is_banned']:
-        await update.message.reply_text("You are banned from using this bot.")
+        await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
         return
     
     # Check credits
     if user['credits'] < EMAIL_COST:
         await update.message.reply_text(
-            f"Not enough credits! You need {EMAIL_COST} credit. Use /daily to earn more."
+            f"⚠️ <b>Not enough credits!</b> You need <code>{EMAIL_COST} credit</code>.\n👉 Use /daily or refer friends to earn more.",
+            parse_mode=ParseMode.HTML
         )
         return
     
     # Deduct credits
     if not db.deduct_credits(user_id, EMAIL_COST):
-        await update.message.reply_text("Transaction failed. Try again.")
+        await update.message.reply_text("⚠️ Transaction failed. Try again.", parse_mode=ParseMode.HTML)
         return
     
     # Generate email
-    status_msg = await update.message.reply_text("Generating email...")
+    status_msg = await update.message.reply_text("⚙️ <b>Generating your premium address...</b>", parse_mode=ParseMode.HTML)
     
     email = await EmailService.generate_email(user_id)
     if not email:
         db._execute("UPDATE users SET credits = credits + ? WHERE user_id = ?", (EMAIL_COST, user_id))
         db.conn.commit()
-        await status_msg.edit_text("Failed to generate email. Please try again later.")
+        await status_msg.edit_text("❌ <b>Failed to generate email. Please try again later.</b>", parse_mode=ParseMode.HTML)
         return
     
     db.set_email(user_id, email)
     
+    body = (
+        f"📧 <b>Your New Temporary Email:</b>\n"
+        f"<code>{email}</code>\n\n"
+        f"💰 <b>Cost:</b> <code>{EMAIL_COST} credit</code>\n"
+        f"📥 <i>Tap the <b>INBOX</b> button below to check your mail!</i>"
+    )
+    
     await status_msg.edit_text(
-        UI.box("New Email Generated", f"📧 `{email}`\n\n💰 Cost: `{EMAIL_COST} credit`\n📥 Use /inbox to check messages."),
-        parse_mode=ParseMode.MARKDOWN,
+        UI.box("Email Generated", body),
+        parse_mode=ParseMode.HTML,
         reply_markup=UI.get_reply_keyboard()
     )
 
@@ -1243,25 +1402,25 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(user_id)
     
     if not user:
-        await update.message.reply_text("Please use /start first to register.")
+        await update.message.reply_text("⚠️ Please use /start first to register.", parse_mode=ParseMode.HTML)
         return
     
     if user['is_banned']:
-        await update.message.reply_text("You are banned from using this bot.")
+        await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
         return
     
     email = user.get('email', '')
     if not email:
-        await update.message.reply_text("No email found. Use /newemail to generate one.")
+        await update.message.reply_text("📧 <b>No email found.</b> Tap <b>NEW EMAIL</b> to generate one.", parse_mode=ParseMode.HTML)
         return
     
     messages = await EmailService.get_messages(user_id, email)
     if messages is None:
-        await update.message.reply_text("Error fetching inbox. Your email session may have expired. Please generate a 🆕 NEW EMAIL.")
+        await update.message.reply_text("❌ <b>Error fetching inbox.</b> Your email session may have expired. Please generate a 🆕 <b>NEW EMAIL</b>.", parse_mode=ParseMode.HTML)
         return
     
     if not messages:
-        await update.message.reply_text("Inbox is empty.")
+        await update.message.reply_text("📥 <b>Your inbox is currently empty.</b>", parse_mode=ParseMode.HTML)
         return
     
     # Sort by newest first (by date)
@@ -1282,7 +1441,8 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     end = start + MESSAGES_PER_PAGE
     page_messages = messages[start:end]
     
-    body = f"📧 `{email}`\n\n"
+    body = f"📧 <b>Mailbox:</b> <code>{email}</code>\n"
+    body += "━━━━━━━━━━━━━━━━━━━━━\n\n"
     
     for msg_data in page_messages:
         mid = msg_data.get('messageID', '?')
@@ -1291,24 +1451,28 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Check if seen
         seen = db.is_message_seen(user_id, mid)
-        icon = "📩" if not seen else "📖"
+        icon = "✉️" if not seen else "📖"
         
-        body += f"{icon} `{subject[:40]}`\n   From: {from_addr}\n   /read_{mid}\n\n"
+        body += (
+            f"{icon} <b>Subject:</b> {html.escape(subject[:40])}\n"
+            f"👤 <b>From:</b> {html.escape(from_addr[:40])}\n"
+            f"🔗 <b>Open Message:</b> /read_{mid}\n\n"
+        )
     
-    body += f"Page {page + 1}/{total_pages} | {len(messages)} messages"
+    body += f"📖 <b>Page {page + 1} of {total_pages}</b> | {len(messages)} total messages"
     
     # Build navigation buttons
     buttons = []
     if page > 0:
-        buttons.append(InlineKeyboardButton("Previous", callback_data=f"inbox_{page - 1}"))
+        buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"inbox_{page - 1}"))
     if page < total_pages - 1:
-        buttons.append(InlineKeyboardButton("Next", callback_data=f"inbox_{page + 1}"))
+        buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"inbox_{page + 1}"))
     
     reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
     
     await update.message.reply_text(
-        UI.box("Inbox", body),
-        parse_mode=ParseMode.MARKDOWN,
+        UI.box("Your Inbox", body),
+        parse_mode=ParseMode.HTML,
         reply_markup=reply_markup
     )
 
@@ -1319,11 +1483,11 @@ async def read_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(user_id)
     
     if not user:
-        await update.message.reply_text("Please use /start first to register.")
+        await update.message.reply_text("⚠️ Please use /start first to register.", parse_mode=ParseMode.HTML)
         return
     
     if user['is_banned']:
-        await update.message.reply_text("You are banned from using this bot.")
+        await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
         return
     
     # Extract message ID from command text
@@ -1336,13 +1500,13 @@ async def read_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     email = user.get('email', '')
     
     if not email:
-        await update.message.reply_text("No email found. Use /newemail to generate one.")
+        await update.message.reply_text("📧 <b>No email found.</b> Tap <b>NEW EMAIL</b> to generate one.", parse_mode=ParseMode.HTML)
         return
     
     # Get message content
     content = await EmailService.get_message_content(user_id, email, message_id)
     if not content:
-        await update.message.reply_text("Message not found or could not be retrieved.")
+        await update.message.reply_text("❌ <b>Message not found or could not be retrieved.</b>", parse_mode=ParseMode.HTML)
         return
     
     # Mark as seen
@@ -1366,31 +1530,41 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(user_id)
     
     if not user:
-        await update.message.reply_text("Please use /start first to register.")
+        await update.message.reply_text("⚠️ Please use /start first to register.", parse_mode=ParseMode.HTML)
         return
     
     if user['is_banned']:
-        await update.message.reply_text("You are banned from using this bot.")
+        await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
         return
     
     if not db.can_checkin(user_id):
         streak_info = db.get_streak_info(user_id)
-        body = f"Already checked in today!\n\n🔥 Streak: {streak_info['streak']} days\n\nCome back tomorrow!"
-        await update.message.reply_text(UI.box("Daily Check-in", body), parse_mode=ParseMode.MARKDOWN)
+        body = (
+            f"❌ <b>You have already checked in today!</b>\n\n"
+            f"🔥 <b>Current Streak:</b> <code>{streak_info['streak']} days</code>\n"
+            f"⏳ <i>Come back tomorrow to keep the streak going!</i>"
+        )
+        await update.message.reply_text(UI.box("Daily Check-in", body), parse_mode=ParseMode.HTML)
         return
     
     result = db.do_checkin(user_id)
     credits = db.get_credits(user_id)
     
-    body = f"🎁 +{result['bonus']} credits\n"
+    body = (
+        f"🎁 <b>Check-in successful!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Reward:</b> <code>+{result['bonus']} credits</code>\n"
+    )
     if result['multiplier_active']:
-        body += f"✨ Multiplier: {result['multiplier']}x 🔥\n"
-    body += f"🔥 Streak: {result['streak']} days\n"
-    body += f"💰 Balance: {credits} credits"
+        body += f"✨ <b>Multiplier Active:</b> <code>{result['multiplier']}x</code> 🔥\n"
+    body += (
+        f"🔥 <b>New Streak:</b> <code>{result['streak']} days</code>\n"
+        f"💳 <b>New Wallet Balance:</b> <code>{credits} credits</code>"
+    )
     
     await update.message.reply_text(
         UI.box("Daily Check-in", body),
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -1400,11 +1574,11 @@ async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(user_id)
     
     if not user:
-        await update.message.reply_text("Please use /start first to register.")
+        await update.message.reply_text("⚠️ Please use /start first to register.", parse_mode=ParseMode.HTML)
         return
     
     if user['is_banned']:
-        await update.message.reply_text("You are banned from using this bot.")
+        await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
         return
     
     ref_code = user['referral_code']
@@ -1414,15 +1588,16 @@ async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ref_stats = db.get_referral_stats(user_id)
     
     body = (
-        f"🔗 Your referral link:\n`{ref_link}`\n\n"
-        f"👥 Referrals: {ref_stats['count']}\n"
-        f"💰 Earned from referrals: {ref_stats['total_bonus']} credits\n\n"
-        f"Share your link and earn {REFERRAL_BONUS} credits per referral!"
+        f"🔗 <b>Your Exclusive Invite Link:</b>\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"👥 <b>Total Invited:</b> <code>{ref_stats['count']} users</code>\n"
+        f"💰 <b>Total Earned:</b> <code>{ref_stats['total_bonus']} credits</code>\n\n"
+        f"📣 <i>Share your link! You will earn <code>{REFERRAL_BONUS} credits</code> for every user who registers.</i>"
     )
     
     await update.message.reply_text(
         UI.box("Referral Program", body),
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -1432,26 +1607,26 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(user_id)
     
     if not user:
-        await update.message.reply_text("Please use /start first to register.")
+        await update.message.reply_text("⚠️ Please use /start first to register.", parse_mode=ParseMode.HTML)
         return
     
     if user['is_banned']:
-        await update.message.reply_text("You are banned from using this bot.")
+        await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
         return
     
     ref_stats = db.get_referral_stats(user_id)
     streak_info = db.get_streak_info(user_id)
     
     body = (
-        f"💳 Balance: {user['credits']} credits\n"
-        f"📈 Total Earned: {user['total_earned']} credits\n\n"
-        f"👥 Referrals: {ref_stats['count']}\n"
-        f"🔥 Streak: {streak_info['streak']} days\n\n"
-        f"Earn more: /daily, /referral, /redeem"
+        f"💳 <b>Wallet Balance:</b> <code>{user['credits']} credits</code>\n"
+        f"📈 <b>Lifetime Earnings:</b> <code>{user['total_earned']} credits</code>\n\n"
+        f"👥 <b>Referrals:</b> <code>{ref_stats['count']} users</code>\n"
+        f"🔥 <b>Streak:</b> <code>{streak_info['streak']} days</code>\n\n"
+        f"💡 <i>Earn more via /daily, invite friends /referral, or redeem a key /redeem</i>"
     )
     await update.message.reply_text(
-        UI.box("Wallet", body),
-        parse_mode=ParseMode.MARKDOWN
+        UI.box("Wallet Balance", body),
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -1461,30 +1636,30 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(user_id)
     
     if not user:
-        await update.message.reply_text("Please use /start first to register.")
+        await update.message.reply_text("⚠️ Please use /start first to register.", parse_mode=ParseMode.HTML)
         return
     
     if user['is_banned']:
-        await update.message.reply_text("You are banned from using this bot.")
+        await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
         return
     
     ref_stats = db.get_referral_stats(user_id)
     streak_info = db.get_streak_info(user_id)
     
     body = (
-        f"👤 {user['first_name']}\n"
-        f"🆔 `{user_id}`\n"
-        f"📧 `{user.get('email', 'N/A')}`\n"
-        f"📅 Joined: {str(user['joined_at'])[:10]}\n\n"
-        f"💰 Credits: {user['credits']}\n"
-        f"📈 Earned: {user['total_earned']}\n"
-        f"👥 Referrals: {ref_stats['count']}\n"
-        f"🔥 Streak: {streak_info['streak']} days\n"
-        f"📧 Emails: {user['total_emails']}"
+        f"👤 <b>Name:</b> {html.escape(user['first_name'])}\n"
+        f"🆔 <b>Account ID:</b> <code>{user_id}</code>\n"
+        f"📧 <b>Current Mail:</b> <code>{user.get('email', 'N/A')}</code>\n"
+        f"📅 <b>Joined:</b> <code>{str(user['joined_at'])[:10]}</code>\n━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Wallet Balance:</b> <code>{user['credits']} cr</code>\n"
+        f"📈 <b>Lifetime Earned:</b> <code>{user['total_earned']} cr</code>\n"
+        f"👥 <b>Total Referrals:</b> <code>{ref_stats['count']}</code>\n"
+        f"🔥 <b>Check-in Streak:</b> <code>{streak_info['streak']} days</code>\n"
+        f"📧 <b>Emails Generated:</b> <code>{user['total_emails']}</code>"
     )
     await update.message.reply_text(
-        UI.box("Your Stats", body),
-        parse_mode=ParseMode.MARKDOWN
+        UI.box("Account Statistics", body),
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -1494,11 +1669,11 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = db.get_user(user_id)
     
     if not user:
-        await update.message.reply_text("Please use /start first to register.")
+        await update.message.reply_text("⚠️ Please use /start first to register.", parse_mode=ParseMode.HTML)
         return
     
     if user['is_banned']:
-        await update.message.reply_text("You are banned from using this bot.")
+        await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
         return
     
     # Get top users by credits
@@ -1508,22 +1683,22 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         (LEADERBOARD_LIMIT,)
     )
     
-    body = "🏆 Credits Leaderboard\n\n"
+    body = "🏆 <b>TOP CREDITS LEADERBOARD</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
     
     medals = ["🥇", "🥈", "🥉"]
     for i, u in enumerate(top_users):
         rank = i + 1
-        medal = medals[i] if i < 3 else f"{rank}."
+        medal = medals[i] if i < 3 else f"<code>{rank:02d}.</code>"
         name = u['first_name'] or f"User {u['user_id']}"
         if u['username']:
             name = f"@{u['username']}"
         
-        highlight = " ⬅️ You" if u['user_id'] == user_id else ""
-        body += f"{medal} {name} - {u['credits']} credits{highlight}\n"
+        highlight = " 🌟 (You)" if u['user_id'] == user_id else ""
+        body += f"{medal} <b>{html.escape(name)}</b> - <code>{u['credits']} credits</code>{highlight}\n"
     
     await update.message.reply_text(
         UI.box("Leaderboard", body),
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -1533,24 +1708,24 @@ async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(user_id)
     
     if not user:
-        await update.message.reply_text("Please use /start first to register.")
+        await update.message.reply_text("⚠️ Please use /start first to register.", parse_mode=ParseMode.HTML)
         return
     
     if user['is_banned']:
-        await update.message.reply_text("You are banned from using this bot.")
+        await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
         return
     
     if not context.args:
         await update.message.reply_text(
-            "Usage: `/redeem <CODE>`\n\nExample: `/redeem ABC123XYZ789`",
-            parse_mode=ParseMode.MARKDOWN
+            "💡 <b>Usage:</b> <code>/redeem &lt;CODE&gt;</code>\n\nExample: <code>/redeem GIFT50CREDITS</code>",
+            parse_mode=ParseMode.HTML
         )
         return
     
     code = context.args[0].upper()
     success, message = db.redeem_pass(code, user_id)
     
-    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"🔑 <b>Redeem Pass:</b>\n\n{message}", parse_mode=ParseMode.HTML)
 
 
 # ================================================================================
@@ -1649,66 +1824,31 @@ async def _display_inbox_page(query, context, user_id: int, page: int):
     start = page * MESSAGES_PER_PAGE
     end = start + MESSAGES_PER_PAGE
     page_messages = messages[start:end]
-    
-    body = f"📧 `{email}`\n\n"
-    
-    for msg_data in page_messages:
-        mid = msg_data.get('messageID', '?')
-        subject = msg_data.get('subject', msg_data.get('from', 'No Subject'))
-        from_addr = msg_data.get('from', 'Unknown')
-        
-        seen = db.is_message_seen(user_id, mid)
-        icon = "📩" if not seen else "📖"
-        
-        body += f"{icon} `{subject[:40]}`\n   From: {from_addr}\n   /read_{mid}\n\n"
-    
-    body += f"Page {page + 1}/{total_pages} | {len(messages)} messages"
-    
-    buttons = []
-    if page > 0:
-        buttons.append(InlineKeyboardButton("Previous", callback_data=f"inbox_{page - 1}"))
-    if page < total_pages - 1:
-        buttons.append(InlineKeyboardButton("Next", callback_data=f"inbox_{page + 1}"))
-    
-    reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
-    
-    await query.edit_message_text(
-        UI.box("Inbox", body),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=reply_markup
-    )
-
-
-# ================================================================================
-# ADMIN COMMANDS
-# ================================================================================
-
-@admin_only
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Open admin panel."""
     body = (
-        "*Pass System:*\n"
-        "• `/createpass <cr> [uses] [days]`\n"
-        "• `/listpass` - List all passes\n"
-        "• `/delpass <code>` - Delete pass\n"
-        "• `/passinfo <code>` - Pass details\n\n"
-        "*Force Join (Dynamic):*\n"
-        "• `/addchannel <@channel>` - Add force channel\n"
-        "• `/removechannel <@channel>` - Remove force channel\n"
-        "• `/listchannels` - List all force channels\n\n"
-        "*User Management:*\n"
-        "• `/ban <id>` - Ban user\n"
-        "• `/unban <id>` - Unban user\n"
-        "• `/userinfo <id>` - User details\n\n"
-        "*Statistics:*\n"
-        "• `/stats` - Bot stats\n"
-        "• `/adminlogs` - Admin action logs\n\n"
-        "*Communication:*\n"
-        "• `/broadcast <msg>` - Message all users"
+        "🔑 <b>PASS / KEY SYSTEM</b>\n"
+        "• <code>/createpass &lt;credits&gt; [uses=1] [days=0]</code>\n"
+        "• <code>/listpass</code> - List recent passcodes\n"
+        "• <code>/delpass &lt;code&gt;</code> - Delete a passcode\n"
+        "• <code>/passinfo &lt;code&gt;</code> - View passcode usage\n\n"
+        "📢 <b>FORCE JOIN MANAGEMENT</b>\n"
+        "• <code>/addchannel &lt;@username&gt;</code> - Add channel lock\n"
+        "• <code>/removechannel &lt;@username&gt;</code> - Remove channel lock\n"
+        "• <code>/listchannels</code> - List locked channels\n\n"
+        "👤 <b>USER MODERATION</b>\n"
+        "• <code>/ban &lt;user_id&gt;</code> - Ban user from bot\n"
+        "• <code>/unban &lt;user_id&gt;</code> - Lift user ban\n"
+        "• <code>/userinfo &lt;user_id&gt;</code> - Fetch user database record\n\n"
+        "📊 <b>BOT MONITORING</b>\n"
+        "• <code>/stats</code> - Global bot metrics\n"
+        "• <code>/adminlogs</code> - Admin action audit trail\n\n"
+        "📡 <b>ANNOUNCEMENT</b>\n"
+        "• <code>/broadcast &lt;message&gt;</code> - Broadcast HTML alert to all"
     )
     await update.message.reply_text(
-        UI.box("Admin Panel", body),
-        parse_mode=ParseMode.MARKDOWN
+        UI.box("Admin Operations Console", body),
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -1717,8 +1857,8 @@ async def admin_createpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Create a pass/key."""
     if len(context.args) < 1:
         await update.message.reply_text(
-            "Usage: `/createpass <credits> [max_uses=1] [expires_days=0]`",
-            parse_mode=ParseMode.MARKDOWN
+            "💡 <b>Usage:</b> <code>/createpass &lt;credits&gt; [max_uses=1] [expires_days=0]</code>",
+            parse_mode=ParseMode.HTML
         )
         return
     
@@ -1727,11 +1867,11 @@ async def admin_createpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_uses = int(context.args[1]) if len(context.args) > 1 else 1
         expires_days = int(context.args[2]) if len(context.args) > 2 else 0
     except ValueError:
-        await update.message.reply_text("Invalid arguments. Use numbers.")
+        await update.message.reply_text("⚠️ <b>Invalid arguments. Use numbers.</b>", parse_mode=ParseMode.HTML)
         return
     
     if credits <= 0 or max_uses <= 0 or expires_days < 0:
-        await update.message.reply_text("Values must be positive.")
+        await update.message.reply_text("⚠️ <b>Values must be positive.</b>", parse_mode=ParseMode.HTML)
         return
     
     code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=12))
@@ -1739,18 +1879,18 @@ async def admin_createpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if db.create_pass(code, credits, max_uses, update.effective_user.id, expires_days):
         expiry_text = f"Expires in {expires_days} days" if expires_days > 0 else "Never expires"
         body = (
-            f"🔑 Code: `{code}`\n"
-            f"💰 Credits: `{credits}`\n"
-            f"🔄 Max Uses: `{max_uses}`\n"
-            f"⏰ Expiry: `{expiry_text}`\n\n"
-            f"Users redeem with:\n`/redeem {code}`"
+            f"🔑 <b>Pass Code:</b> <code>{code}</code>\n"
+            f"💰 <b>Credits:</b> <code>{credits}</code>\n"
+            f"🔄 <b>Max Uses:</b> <code>{max_uses}</code>\n"
+            f"⏰ <b>Expiry:</b> <code>{expiry_text}</code>\n\n"
+            f"👉 <i>Redeem with:</i>\n<code>/redeem {code}</code>"
         )
         await update.message.reply_text(
             UI.box("Pass Created", body),
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.HTML
         )
     else:
-        await update.message.reply_text("Error creating pass. Try again.")
+        await update.message.reply_text("❌ <b>Error creating pass. Try again.</b>", parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -1758,17 +1898,17 @@ async def admin_listpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all passes."""
     passes = db.list_passes()
     if not passes:
-        await update.message.reply_text("No passes created yet.")
+        await update.message.reply_text("⚠️ <b>No active passes created yet.</b>", parse_mode=ParseMode.HTML)
         return
     
-    body = ""
+    body = "📋 <b>ACTIVE PASSES (LATEST 20)</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
     for p in passes[:20]:
         expiry = f"Exp: {str(p['expires_at'])[:10]}" if p['expires_at'] else "No expiry"
-        body += f"🔑 `{p['code']}` - `{p['credits']}cr` | `{p['uses_left']}/{p['max_uses']}` | {expiry}\n\n"
+        body += f"🔑 <code>{p['code']}</code>\n💰 <code>{p['credits']} cr</code> | 🔄 <code>{p['uses_left']}/{p['max_uses']}</code> | ⏰ {expiry}\n\n"
     
     await update.message.reply_text(
         UI.box("All Passes", body),
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -1776,37 +1916,37 @@ async def admin_listpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_delpass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete a pass."""
     if not context.args:
-        await update.message.reply_text("Usage: `/delpass <code>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("💡 <b>Usage:</b> <code>/delpass &lt;code&gt;</code>", parse_mode=ParseMode.HTML)
         return
     
     code = context.args[0].upper()
     db.delete_pass(code)
-    await update.message.reply_text(f"Deleted pass `{code}`", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"✅ <b>Deleted pass</b> <code>{code}</code>", parse_mode=ParseMode.HTML)
 
 
 @admin_only
 async def admin_passinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get pass information."""
     if not context.args:
-        await update.message.reply_text("Usage: `/passinfo <code>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("💡 <b>Usage:</b> <code>/passinfo &lt;code&gt;</code>", parse_mode=ParseMode.HTML)
         return
     
     info = db.get_pass_info(context.args[0])
     if not info:
-        await update.message.reply_text("Pass not found.")
+        await update.message.reply_text("❌ <b>Pass not found.</b>", parse_mode=ParseMode.HTML)
         return
     
     expiry = f"Expires: {str(info['expires_at'])[:10]}" if info['expires_at'] else "No expiry"
     body = (
-        f"🔑 Code: `{info['code']}`\n"
-        f"💰 Credits: `{info['credits']}`\n"
-        f"🔄 Uses: `{info['uses_left']}/{info['max_uses']}`\n"
-        f"⏰ {expiry}\n"
-        f"📅 Created: `{str(info['created_at'])[:10]}`"
+        f"🔑 <b>Code:</b> <code>{info['code']}</code>\n"
+        f"💰 <b>Credits:</b> <code>{info['credits']}</code>\n"
+        f"🔄 <b>Redemptions:</b> <code>{info['uses_left']}/{info['max_uses']} left</code>\n"
+        f"⏰ <b>Expiry:</b> <code>{expiry}</code>\n"
+        f"📅 <b>Created:</b> <code>{str(info['created_at'])[:10]}</code>"
     )
     await update.message.reply_text(
         UI.box("Pass Info", body),
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -1815,8 +1955,8 @@ async def admin_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a force join channel."""
     if not context.args:
         await update.message.reply_text(
-            "Usage: `/addchannel <channel>`\n\nExample: `/addchannel @my_channel`",
-            parse_mode=ParseMode.MARKDOWN
+            "💡 <b>Usage:</b> <code>/addchannel &lt;channel_username_or_id&gt;</code>\n\nExample: <code>/addchannel @my_channel</code>",
+            parse_mode=ParseMode.HTML
         )
         return
     
@@ -1824,7 +1964,7 @@ async def admin_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_name = ' '.join(context.args[1:]) if len(context.args) > 1 else channel_id
     
     success, message = db.add_force_channel(channel_id, channel_name, update.effective_user.id)
-    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"📢 <b>Force Join System:</b>\n{message}", parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -1832,14 +1972,14 @@ async def admin_removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Remove a force join channel."""
     if not context.args:
         await update.message.reply_text(
-            "Usage: `/removechannel <channel>`\n\nExample: `/removechannel @my_channel`",
-            parse_mode=ParseMode.MARKDOWN
+            "💡 <b>Usage:</b> <code>/removechannel &lt;channel_username_or_id&gt;</code>\n\nExample: <code>/removechannel @my_channel</code>",
+            parse_mode=ParseMode.HTML
         )
         return
     
     channel_id = context.args[0]
     success, message = db.remove_force_channel(channel_id, update.effective_user.id)
-    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"🗑️ <b>Force Join System:</b>\n{message}", parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -1848,22 +1988,22 @@ async def admin_listchannels(update: Update, context: ContextTypes.DEFAULT_TYPE)
     channels = db.list_force_channels()
     
     if not channels:
-        await update.message.reply_text("No force join channels configured.")
+        await update.message.reply_text("⚠️ <b>No force join channels configured.</b>", parse_mode=ParseMode.HTML)
         return
     
     body = ""
     active_count = 0
     for ch in channels:
-        status = "Active" if ch['is_active'] else "Inactive"
+        status = "🟢 Active" if ch['is_active'] else "🔴 Inactive"
         if ch['is_active']:
             active_count += 1
-        body += f"`{ch['channel_id']}` - {status}\n   Added: {ch['added_at'][:10]}\n\n"
+        body += f"📢 <code>{ch['channel_id']}</code> - {status}\n📅 Added: <code>{str(ch['added_at'])[:10]}</code>\n\n"
     
-    body = f"Active: {active_count} | Total: {len(channels)}\n\n" + body
+    body = f"👥 <b>Active:</b> <code>{active_count}</code> | <b>Total:</b> <code>{len(channels)}</code>\n━━━━━━━━━━━━━━━━━━━━━\n\n" + body
     
     await update.message.reply_text(
         UI.box("Force Channels", body),
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -1871,102 +2011,106 @@ async def admin_listchannels(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ban a user."""
     if not context.args:
-        await update.message.reply_text("Usage: `/ban <user_id>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("💡 <b>Usage:</b> <code>/ban &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
         return
     
     try:
         target_id = int(context.args[0])
         if db.ban_user(target_id, update.effective_user.id):
-            await update.message.reply_text(f"Banned `{target_id}`", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"🔨 <b>Successfully banned user</b> <code>{target_id}</code>", parse_mode=ParseMode.HTML)
             
             # Notify user
             try:
                 await context.bot.send_message(
                     chat_id=target_id,
-                    text=UI.box("Banned", "You have been banned from using this bot.\n\nContact an admin if you believe this is a mistake."),
-                    parse_mode=ParseMode.MARKDOWN
+                    text=UI.box("Banned", "⛔️ <b>You have been banned from using this bot.</b>\n\n<i>Contact an administrator if you believe this is an error.</i>"),
+                    parse_mode=ParseMode.HTML
                 )
             except:
                 pass
         else:
             await update.message.reply_text(
-                f"Could not ban `{target_id}`. User may not exist or is already banned.",
-                parse_mode=ParseMode.MARKDOWN
+                f"❌ Could not ban <code>{target_id}</code>. User may not exist or is already banned.",
+                parse_mode=ParseMode.HTML
             )
     except ValueError:
-        await update.message.reply_text("Invalid user ID.")
+        await update.message.reply_text("⚠️ <b>Invalid user ID. Use a numeric Telegram ID.</b>", parse_mode=ParseMode.HTML)
 
 
 @admin_only
 async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Unban a user."""
     if not context.args:
-        await update.message.reply_text("Usage: `/unban <user_id>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("💡 <b>Usage:</b> <code>/unban &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
         return
     
     try:
         target_id = int(context.args[0])
         if db.unban_user(target_id, update.effective_user.id):
-            await update.message.reply_text(f"Unbanned `{target_id}`", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"✅ <b>Successfully unbanned user</b> <code>{target_id}</code>", parse_mode=ParseMode.HTML)
             
             # Notify user
             try:
                 await context.bot.send_message(
                     chat_id=target_id,
-                    text=UI.box("Unbanned", "You have been unbanned and can now use the bot again.\n\nUse /start to continue."),
-                    parse_mode=ParseMode.MARKDOWN
+                    text=UI.box("Unbanned", "🎉 <b>You have been unbanned!</b> You can now use the bot again.\n\n👉 Send /start to reload."),
+                    parse_mode=ParseMode.HTML
                 )
             except:
                 pass
         else:
             await update.message.reply_text(
-                f"Could not unban `{target_id}`. User may not exist or is not banned.",
-                parse_mode=ParseMode.MARKDOWN
+                f"❌ Could not unban <code>{target_id}</code>. User may not exist or is not banned.",
+                parse_mode=ParseMode.HTML
             )
     except ValueError:
-        await update.message.reply_text("Invalid user ID.")
+        await update.message.reply_text("⚠️ <b>Invalid user ID. Use a numeric Telegram ID.</b>", parse_mode=ParseMode.HTML)
 
 
 @admin_only
 async def admin_userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get detailed user information."""
     if not context.args:
-        await update.message.reply_text("Usage: `/userinfo <user_id>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("💡 <b>Usage:</b> <code>/userinfo &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
         return
     
     try:
         target_id = int(context.args[0])
         u = db.get_user(target_id)
         if not u:
-            await update.message.reply_text(f"User `{target_id}` not found.", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"❌ User <code>{target_id}</code> not found in database.", parse_mode=ParseMode.HTML)
             return
         
         ref_stats = db.get_referral_stats(target_id)
         streak_info = db.get_streak_info(target_id)
         
         body = (
-            f"🆔 ID: `{u['user_id']}`\n"
-            f"👤 Name: `{u['first_name']}`\n"
-            f"👤 Username: @{u['username']}\n" if u['username'] else ""
-            f"📧 Email: `{u.get('email', 'N/A')}`\n\n"
-            f"--- ECONOMY ---\n"
-            f"💰 Credits: `{u['credits']}`\n"
-            f"📈 Earned: `{u['total_earned']}`\n"
-            f"📧 Emails: `{u['total_emails']}`\n\n"
-            f"--- ACTIVITY ---\n"
-            f"👥 Referrals: `{ref_stats['count']}`\n"
-            f"🔥 Streak: `{streak_info['streak']} days`\n"
-            f"📅 Joined: `{u['joined_at'][:10]}`\n"
-            f"📅 Last Check-in: `{u.get('last_checkin', 'Never')}`\n\n"
-            f"--- STATUS ---\n"
-            f"🚫 Banned: `{'Yes' if u['is_banned'] else 'No'}`"
+            f"👤 <b>PROFILE</b>\n"
+            f"• <b>User ID:</b> <code>{u['user_id']}</code>\n"
+            f"• <b>First Name:</b> <code>{html.escape(u['first_name'])}</code>\n"
+        )
+        if u['username']:
+            body += f"• <b>Username:</b> @{html.escape(u['username'])}\n"
+        body += (
+            f"• <b>Email:</b> <code>{u.get('email', 'N/A')}</code>\n\n"
+            f"💰 <b>ECONOMY</b>\n"
+            f"• <b>Credits:</b> <code>{u['credits']} cr</code>\n"
+            f"• <b>Lifetime Earned:</b> <code>{u['total_earned']} cr</code>\n"
+            f"• <b>Emails Generated:</b> <code>{u['total_emails']}</code>\n\n"
+            f"📈 <b>ENGAGEMENT</b>\n"
+            f"• <b>Referrals:</b> <code>{ref_stats['count']} users</code>\n"
+            f"• <b>Daily Streak:</b> <code>{streak_info['streak']} days</code>\n"
+            f"• <b>Joined Bot:</b> <code>{str(u['joined_at'])[:10]}</code>\n"
+            f"• <b>Last Checkin:</b> <code>{u.get('last_checkin', 'Never')}</code>\n\n"
+            f"🚫 <b>ACCOUNT STATUS</b>\n"
+            f"• <b>Is Banned:</b> <code>{'🔴 YES' if u['is_banned'] else '🟢 NO'}</code>"
         )
         await update.message.reply_text(
-            UI.box("User Info", body),
-            parse_mode=ParseMode.MARKDOWN
+            UI.box("User Account Details", body),
+            parse_mode=ParseMode.HTML
         )
     except ValueError:
-        await update.message.reply_text("Invalid user ID.")
+        await update.message.reply_text("⚠️ <b>Invalid user ID. Use a numeric Telegram ID.</b>", parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -1975,28 +2119,25 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = db.get_stats()
     
     body = (
-        f"--- USERS ---\n"
-        f"👥 Total: `{stats['total_users']}`\n"
-        f"🟢 Active Today: `{stats['active_today']}`\n\n"
-        f"--- USAGE ---\n"
-        f"📧 Emails Generated: `{stats['total_emails']}`\n"
-        f"📅 Check-ins: `{stats['total_checkins']}`\n"
-        f"👥 Referrals: `{stats['total_referrals']}`\n\n"
-        f"--- PASS SYSTEM ---\n"
-        f"🔑 Created: `{stats['total_passes_created']}`\n"
-        f"🎫 Redeemed: `{stats['total_pass_redemptions']}`\n"
-        f"📋 Active: `{stats['total_passes']}`\n\n"
-        f"--- MODERATION ---\n"
-        f"🔨 Bans: `{stats['total_bans']}`\n"
-        f"✅ Unbans: `{stats['total_unbans']}`\n\n"
-        f"--- FORCE JOIN ---\n"
-        f"📢 Channels: `{stats['total_force_channels']}`\n\n"
-        f"--- BROADCASTS ---\n"
-        f"📢 Total: `{stats['total_broadcasts']}`"
+        f"👥 <b>USER BASE METRICS</b>\n"
+        f"• <b>Total Registered:</b> <code>{stats['total_users']} users</code>\n"
+        f"• <b>Active Today:</b> <code>{stats['active_today']} users</code>\n\n"
+        f"📨 <b>BOT ACTIVITY STATS</b>\n"
+        f"• <b>Emails Generated:</b> <code>{stats['total_emails']} addresses</code>\n"
+        f"• <b>Check-ins Claimed:</b> <code>{stats['total_checkins']} daily</code>\n"
+        f"• <b>Successful Referrals:</b> <code>{stats['total_referrals']} signups</code>\n\n"
+        f"🔑 <b>CREDIT KEY SYSTEM</b>\n"
+        f"• <b>Keys Created:</b> <code>{stats['total_passes_created']} keys</code>\n"
+        f"• <b>Keys Redeemed:</b> <code>{stats['total_pass_redemptions']} keys</code>\n"
+        f"• <b>Unredeemed Active:</b> <code>{stats['total_passes']} keys</code>\n\n"
+        f"⚙️ <b>SYSTEM CONFIG</b>\n"
+        f"• <b>Locked Channels:</b> <code>{stats['total_force_channels']} channels</code>\n"
+        f"• <b>Total Bans Enforced:</b> <code>{stats['total_bans']} users</code>\n"
+        f"• <b>Total Broadcasts:</b> <code>{stats['total_broadcasts']} alerts</code>"
     )
     await update.message.reply_text(
-        UI.box("Bot Statistics", body),
-        parse_mode=ParseMode.MARKDOWN
+        UI.box("Server Administration Statistics", body),
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -2006,7 +2147,7 @@ async def admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logs = db.get_admin_logs(30)
     
     if not logs:
-        await update.message.reply_text("No admin logs yet.")
+        await update.message.reply_text("⚠️ <b>No admin logs found.</b>", parse_mode=ParseMode.HTML)
         return
     
     body = ""
@@ -2016,11 +2157,11 @@ async def admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'broadcast': '📡', 'create_pass': '🔑'
         }.get(log['action'], '🔹')
         
-        body += f"{action_emoji} `{log['action']}` - `{log['target']}`\n   👤 {log['admin_name'] or log['admin_id']} | 🕐 {str(log['created_at'])[:16]}\n\n"
+        body += f"{action_emoji} <b>{log['action'].upper()}</b> ➔ <code>{log['target']}</code>\n👤 Admin: <code>{html.escape(log['admin_name'] or str(log['admin_id']))}</code> | 🕐 {str(log['created_at'])[:16]}\n\n"
     
     await update.message.reply_text(
-        UI.box("Admin Logs", body),
-        parse_mode=ParseMode.MARKDOWN
+        UI.box("Admin Security Log Trail", body),
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -2028,14 +2169,14 @@ async def admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Broadcast a message to all users."""
     if not context.args:
-        body = "Usage: `/broadcast <message>`\n\nExample: `/broadcast Hello everyone! New update available!`"
-        await update.message.reply_text(UI.box("Broadcast", body), parse_mode=ParseMode.MARKDOWN)
+        body = "💡 <b>Usage:</b> <code>/broadcast &lt;message&gt;</code>\n\nExample: <code>/broadcast Premium updates released!</code>"
+        await update.message.reply_text(UI.box("Broadcast System", body), parse_mode=ParseMode.HTML)
         return
     
     message = " ".join(context.args)
     users = db.get_all_user_ids()
     
-    await update.message.reply_text(f"Broadcasting to {len(users)} users...")
+    await update.message.reply_text(f"📡 <b>Initiating broadcast to {len(users)} users...</b>", parse_mode=ParseMode.HTML)
     
     sent = 0
     failed = 0
@@ -2044,8 +2185,8 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=uid,
-                text=UI.box("Broadcast", message),
-                parse_mode=ParseMode.MARKDOWN
+                text=UI.box("Notification Alert", message),
+                parse_mode=ParseMode.HTML
             )
             sent += 1
             time.sleep(0.05)  # Rate limiting
@@ -2055,10 +2196,16 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db.log_broadcast(update.effective_user.id, message, sent, failed)
     
-    body = f"✅ Sent: `{sent}`\n❌ Failed: `{failed}`\n👥 Total: `{len(users)}`"
+    body = (
+        f"✅ <b>Broadcast complete!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 <b>Sent:</b> <code>{sent} users</code>\n"
+        f"🔴 <b>Failed:</b> <code>{failed} users</code>\n"
+        f"👥 <b>Target Pool:</b> <code>{len(users)} users</code>"
+    )
     await update.message.reply_text(
-        UI.box("Broadcast Complete", body),
-        parse_mode=ParseMode.MARKDOWN
+        UI.box("Broadcast Audit Result", body),
+        parse_mode=ParseMode.HTML
     )
 
 
