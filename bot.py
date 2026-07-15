@@ -1370,19 +1370,6 @@ async def new_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user['is_banned']:
         await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
         return
-        
-    # Block and guide if Gmail is not configured
-    if not GmailService.is_configured():
-        guide = (
-            "⚠️ <b>Gmail Master Account Not Configured!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "To generate premium <b>@gmail.com</b> temporary emails, the bot administrator must configure the master credentials in Render's environment variables:\n\n"
-            "1️⃣ <b>GMAIL_USER</b> ➔ Your master Gmail address (e.g. <code>mymailbox@gmail.com</code>)\n"
-            "2️⃣ <b>GMAIL_APP_PASSWORD</b> ➔ 16-character Google App Password\n\n"
-            "💡 <i>Once added on Render, this command will instantly create high-speed Gmail addresses!</i>"
-        )
-        await update.message.reply_text(UI.box("Setup Needed", guide), parse_mode=ParseMode.HTML)
-        return
     
     # Check credits
     if user['credits'] < EMAIL_COST:
@@ -1413,8 +1400,12 @@ async def new_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📧 <b>Your New Temporary Email:</b>\n"
         f"<code>{email}</code>\n\n"
         f"💰 <b>Cost:</b> <code>{EMAIL_COST} credit</code>\n"
-        f"📥 <i>Tap the <b>INBOX</b> button below to check your mail!</i>"
     )
+    
+    if not GmailService.is_configured():
+        body += "💡 <i>Pro Tip: Add GMAIL_USER & GMAIL_APP_PASSWORD to Render variables to generate real <b>@gmail.com</b> addresses!</i>\n\n"
+        
+    body += "📥 <i>Tap the <b>INBOX</b> button below to check your mail!</i>"
     
     await status_msg.edit_text(
         UI.box("Email Generated", body),
