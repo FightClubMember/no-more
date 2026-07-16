@@ -289,6 +289,15 @@ class Database:
                         failed_count INTEGER DEFAULT 0,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
+                    
+                    -- Short message link mapping
+                    CREATE TABLE IF NOT EXISTS message_links (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        email TEXT NOT NULL,
+                        raw_message_id TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
                 """
                 with self.conn.cursor() as cur:
                     cur.execute(schema)
@@ -300,6 +309,7 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_seen_user ON seen_messages(user_id)",
                     "CREATE INDEX IF NOT EXISTS idx_used_passes_user ON used_passes(user_id)",
                     "CREATE INDEX IF NOT EXISTS idx_admin_logs_admin ON admin_logs(admin_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_message_links_user ON message_links(user_id)",
                 ]
                 with self.conn.cursor() as cur:
                     for idx in indexes:
@@ -415,6 +425,15 @@ class Database:
                         failed_count INTEGER DEFAULT 0,
                         created_at TEXT DEFAULT (datetime('now'))
                     );
+                    
+                    -- Short message link mapping
+                    CREATE TABLE IF NOT EXISTS message_links (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        email TEXT NOT NULL,
+                        raw_message_id TEXT NOT NULL,
+                        created_at TEXT DEFAULT (datetime('now'))
+                    );
                 """)
                 
                 indexes = [
@@ -424,6 +443,7 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_seen_user ON seen_messages(user_id)",
                     "CREATE INDEX IF NOT EXISTS idx_used_passes_user ON used_passes(user_id)",
                     "CREATE INDEX IF NOT EXISTS idx_admin_logs_admin ON admin_logs(admin_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_message_links_user ON message_links(user_id)",
                 ]
                 for idx in indexes:
                     self.conn.execute(idx)
@@ -691,6 +711,40 @@ class Database:
             "SELECT 1 FROM seen_messages WHERE user_id = ? AND message_id = ?", (user_id, message_id)
         )
         return row is not None
+
+    def save_message_link(self, user_id: int, email: str, raw_message_id: str) -> int:
+        """Save a message mapping and return its ID."""
+        with self.lock:
+            # Check if this mapping already exists to prevent duplicate IDs
+            existing = self._fetchone(
+                "SELECT id FROM message_links WHERE user_id = ? AND email = ? AND raw_message_id = ?",
+                (user_id, email, raw_message_id)
+            )
+            if existing:
+                return existing['id']
+                
+            if self.is_postgres:
+                self._connect_pg()
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO message_links (user_id, email, raw_message_id) VALUES (%s, %s, %s) RETURNING id",
+                        (user_id, email, raw_message_id)
+                    )
+                    self.conn.commit()
+                    return cur.fetchone()[0]
+            else:
+                cursor = self.conn.execute(
+                    "INSERT INTO message_links (user_id, email, raw_message_id) VALUES (?, ?, ?)",
+                    (user_id, email, raw_message_id)
+                )
+                self.conn.commit()
+                return cursor.lastrowid
+
+    def get_message_link(self, link_id: int) -> Optional[dict]:
+        """Retrieve a message mapping by its ID."""
+        return self._fetchone(
+            "SELECT * FROM message_links WHERE id = ?", (link_id,)
+        )
     
     # ==========================================================================
     # PASS/KEY SYSTEM
@@ -1192,9 +1246,11 @@ class EmailService:
     @staticmethod
     async def generate_email(user_id: int) -> Optional[str]:
         if GmailService.is_configured():
-            return await GmailService.generate_email(user_id)
-        else:
-            return await MailTmService.generate_email(user_id)
+            email = await GmailService.generate_email(user_id)
+            if email:
+                return email
+        # Fallback to Mail.tm
+        return await MailTmService.generate_email(user_id)
             
     @staticmethod
     async def get_messages(user_id: int, email: str) -> Optional[List[dict]]:
@@ -1373,13 +1429,17 @@ async def new_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db.set_email(user_id, email)
     
+    is_gmail = "@gmail.com" in email
+    
     body = (
         f"📧 <b>Your New Temporary Email:</b>\n"
         f"<code>{email}</code>\n\n"
         f"💰 <b>Cost:</b> <code>{EMAIL_COST} credit</code>\n"
     )
     
-    if not os.environ.get("RAPIDAPI_KEY"):
+    if not is_gmail:
+        body += "⚠️ <i>Note: The Gmail generator is temporarily offline or rate-limited. We created a standard temporary address for you.</i>\n\n"
+    elif not os.environ.get("RAPIDAPI_KEY"):
         body += "💡 <i>Pro Tip: Configure your own <code>RAPIDAPI_KEY</code> on Render to customize temporary Gmail creation!</i>\n\n"
     else:
         body += "⚡️ <i>Powered by your custom Gmailnator RapidAPI subscription.</i>\n\n"
@@ -1442,18 +1502,21 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     body += "━━━━━━━━━━━━━━━━━━━━━\n\n"
     
     for msg_data in page_messages:
-        mid = msg_data.get('messageID', '?')
+        raw_mid = msg_data.get('messageID', '?')
         subject = msg_data.get('subject', msg_data.get('from', 'No Subject'))
         from_addr = msg_data.get('from', 'Unknown')
         
+        # Save mapping to get short database ID
+        short_id = db.save_message_link(user_id, email, raw_mid)
+        
         # Check if seen
-        seen = db.is_message_seen(user_id, mid)
+        seen = db.is_message_seen(user_id, raw_mid)
         icon = "✉️" if not seen else "📖"
         
         body += (
             f"{icon} <b>Subject:</b> {html.escape(subject[:40])}\n"
             f"👤 <b>From:</b> {html.escape(from_addr[:40])}\n"
-            f"🔗 <b>Open Message:</b> /read_{mid}\n\n"
+            f"🔗 <b>Open Message:</b> /read_{short_id}\n\n"
         )
     
     body += f"📖 <b>Page {page + 1} of {total_pages}</b> | {len(messages)} total messages"
@@ -1493,12 +1556,29 @@ async def read_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Handle /read_123 or /read_123@botname
-    message_id = text.split('_', 1)[1].split('@', 1)[0]
+    message_val = text.split('_', 1)[1].split('@', 1)[0]
     email = user.get('email', '')
     
     if not email:
         await update.message.reply_text("📧 <b>No email found.</b> Tap <b>NEW EMAIL</b> to generate one.", parse_mode=ParseMode.HTML)
         return
+        
+    # Check if message_val is a short integer ID
+    if message_val.isdigit():
+        link_id = int(message_val)
+        link = db.get_message_link(link_id)
+        if link:
+            # Check owner to prevent unauthorized message sniffing
+            if link['user_id'] != user_id:
+                await update.message.reply_text("⛔️ <b>Access Denied:</b> This message does not belong to you.", parse_mode=ParseMode.HTML)
+                return
+            message_id = link['raw_message_id']
+        else:
+            await update.message.reply_text("❌ <b>Message link expired or not found.</b> Please refresh your /inbox.", parse_mode=ParseMode.HTML)
+            return
+    else:
+        # Fallback if it's the raw string (for backward compatibility)
+        message_id = message_val
     
     # Get message content
     content = await EmailService.get_message_content(user_id, email, message_id)
@@ -1876,17 +1956,20 @@ async def _display_inbox_page(query, context, user_id: int, page: int):
     body += "━━━━━━━━━━━━━━━━━━━━━\n\n"
     
     for msg_data in page_messages:
-        mid = msg_data.get('messageID', '?')
+        raw_mid = msg_data.get('messageID', '?')
         subject = msg_data.get('subject', msg_data.get('from', 'No Subject'))
         from_addr = msg_data.get('from', 'Unknown')
         
-        seen = db.is_message_seen(user_id, mid)
+        # Save mapping to get short database ID
+        short_id = db.save_message_link(user_id, email, raw_mid)
+        
+        seen = db.is_message_seen(user_id, raw_mid)
         icon = "✉️" if not seen else "📖"
         
         body += (
             f"{icon} <b>Subject:</b> {html.escape(subject[:40])}\n"
             f"👤 <b>From:</b> {html.escape(from_addr[:40])}\n"
-            f"🔗 <b>Open Message:</b> /read_{mid}\n\n"
+            f"🔗 <b>Open Message:</b> /read_{short_id}\n\n"
         )
     
     body += f"📖 <b>Page {page + 1} of {total_pages}</b> | {len(messages)} total messages"
