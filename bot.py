@@ -973,130 +973,107 @@ db = Database()
 # ================================================================================
 
 class GmailService:
-    """Custom Gmail IMAP service for dot/plus sub-addressing temporary mail."""
+    """Gmailnator RapidAPI service for generating and checking premium @gmail.com emails."""
     
     @staticmethod
     def is_configured() -> bool:
-        return bool(os.environ.get("GMAIL_USER") and os.environ.get("GMAIL_APP_PASSWORD"))
+        # Always active because we have the fallback key provided by the user
+        return True
         
     @staticmethod
-    def generate_email(user_id: int) -> str:
-        """Generate a unique Gmail plus-variant based on the master account."""
-        gmail_user = os.environ.get("GMAIL_USER")
-        if not gmail_user or "@" not in gmail_user:
-            return ""
-        username, domain = gmail_user.split("@", 1)
-        random_tag = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
-        return f"{username}+{user_id}_{random_tag}@{domain}"
+    def _get_headers() -> dict:
+        key = os.environ.get("RAPIDAPI_KEY", "254d6057e2mshdd2f908ea88316cp1c9d1djsnf9e4c2d82ca9")
+        return {
+            "content-type": "application/json",
+            "x-rapidapi-host": "gmailnator.p.rapidapi.com",
+            "x-rapidapi-key": key
+        }
+
+    @staticmethod
+    async def generate_email(user_id: int) -> Optional[str]:
+        """Generate a premium Gmail address using RapidAPI Gmailnator."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    "https://gmailnator.p.rapidapi.com/api/emails/generate",
+                    json={"types": ["public_gmail_dot", "public_gmail_plus"]},
+                    headers=GmailService._get_headers()
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    email_addr = data.get("email")
+                    if email_addr and "@gmail.com" in email_addr:
+                        return email_addr
+                logging.error(f"RapidAPI Gmailnator generation failed: {r.status_code} {r.text}")
+                return None
+        except Exception as e:
+            logging.error(f"RapidAPI Gmailnator generation error: {e}")
+            return None
 
     @staticmethod
     async def get_messages(user_id: int, email_addr: str) -> Optional[List[dict]]:
-        """Fetch emails from Gmail IMAP folder matching the sub-address."""
-        gmail_user = os.environ.get("GMAIL_USER")
-        gmail_pass = os.environ.get("GMAIL_APP_PASSWORD")
-        if not gmail_user or not gmail_pass:
-            return None
-            
-        def _fetch():
-            try:
-                mail = imaplib.IMAP4_SSL("imap.gmail.com")
-                mail.login(gmail_user, gmail_pass)
-                mail.select("inbox")
-                
-                # Fetch recent messages (e.g. search ALL and take the last 30)
-                status, messages = mail.search(None, 'ALL')
-                if status != "OK" or not messages[0]:
-                    mail.logout()
-                    return []
+        """Fetch emails from Gmailnator RapidAPI inbox."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    "https://gmailnator.p.rapidapi.com/api/inbox",
+                    json={"email": email_addr},
+                    headers=GmailService._get_headers()
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    messages = data.get("messages", [])
                     
-                mail_ids = messages[0].split()
-                # Take the last 30 messages
-                recent_ids = mail_ids[-30:]
-                
-                result = []
-                for mail_id in reversed(recent_ids):
-                    status, data = mail.fetch(mail_id, "(RFC822)")
-                    if status != "OK":
-                        continue
+                    result = []
+                    for msg in messages:
+                        mid = msg.get("messageID") or msg.get("id") or msg.get("message_id")
+                        if not mid:
+                            continue
+                        subject = msg.get("subject", "No Subject")
+                        from_ = msg.get("from", "Unknown")
+                        date_str = msg.get("date", "")
                         
-                    raw_email = data[0][1]
-                    msg = email.message_from_bytes(raw_email)
-                    
-                    # Check if the TO or CC headers match our target sub-address
-                    to_header = str(msg["To"] or "").lower()
-                    cc_header = str(msg["Cc"] or "").lower()
-                    target = email_addr.lower()
-                    if target not in to_header and target not in cc_header:
-                        continue
-                        
-                    subject, encoding = decode_header(msg["Subject"] or "No Subject")[0]
-                    if isinstance(subject, bytes):
-                        subject = subject.decode(encoding or "utf-8", errors="ignore")
-                        
-                    from_, encoding = decode_header(msg["From"] or "Unknown")[0]
-                    if isinstance(from_, bytes):
-                        from_ = from_.decode(encoding or "utf-8", errors="ignore")
-                        
-                    result.append({
-                        "messageID": mail_id.decode(),
-                        "subject": subject,
-                        "from": from_,
-                        "date": msg["Date"] or ""
-                    })
-                    
-                mail.logout()
-                return result
-            except Exception as e:
-                logging.error(f"Gmail IMAP fetch error: {e}")
+                        result.append({
+                            "messageID": str(mid),
+                            "subject": subject,
+                            "from": from_,
+                            "date": date_str
+                        })
+                    return result
+                logging.error(f"RapidAPI Gmailnator list messages failed: {r.status_code} {r.text}")
                 return None
-                
-        return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            logging.error(f"RapidAPI Gmailnator list messages error: {e}")
+            return None
 
     @staticmethod
     async def get_message_content(user_id: int, email_addr: str, message_id: str) -> Optional[str]:
-        """Fetch body of specific IMAP message."""
-        gmail_user = os.environ.get("GMAIL_USER")
-        gmail_pass = os.environ.get("GMAIL_APP_PASSWORD")
-        if not gmail_user or not gmail_pass:
-            return None
-            
-        def _fetch_body():
-            try:
-                mail = imaplib.IMAP4_SSL("imap.gmail.com")
-                mail.login(gmail_user, gmail_pass)
-                mail.select("inbox")
-                
-                status, data = mail.fetch(message_id, "(RFC822)")
-                if status != "OK":
-                    return None
+        """Fetch body of specific message from Gmailnator RapidAPI."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(
+                    f"https://gmailnator.p.rapidapi.com/api/inbox/{message_id}",
+                    headers=GmailService._get_headers()
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    body = None
+                    if isinstance(data, dict):
+                        body = data.get("content") or data.get("body") or data.get("html")
+                        if not body and "message" in data:
+                            msg_obj = data["message"]
+                            if isinstance(msg_obj, dict):
+                                body = msg_obj.get("body") or msg_obj.get("content")
                     
-                raw_email = data[0][1]
-                msg = email.message_from_bytes(raw_email)
-                
-                body = ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        content_type = part.get_content_type()
-                        content_disposition = str(part.get("Content-Disposition"))
+                    if not body:
+                        body = data.get("raw") or str(data)
                         
-                        if content_type == "text/plain" and "attachment" not in content_disposition:
-                            payload = part.get_payload(decode=True)
-                            body = payload.decode(part.get_content_charset() or "utf-8", errors="ignore")
-                            break
-                        elif content_type == "text/html" and "attachment" not in content_disposition:
-                            payload = part.get_payload(decode=True)
-                            body = payload.decode(part.get_content_charset() or "utf-8", errors="ignore")
-                else:
-                    payload = msg.get_payload(decode=True)
-                    body = payload.decode(msg.get_content_charset() or "utf-8", errors="ignore")
-                    
-                mail.logout()
-                return body or "No content"
-            except Exception as e:
-                logging.error(f"Gmail IMAP fetch body error: {e}")
+                    return body
+                logging.error(f"RapidAPI Gmailnator fetch body failed: {r.status_code} {r.text}")
                 return None
-                
-        return await asyncio.to_thread(_fetch_body)
+        except Exception as e:
+            logging.error(f"RapidAPI Gmailnator fetch body error: {e}")
+            return None
 
 
 class MailTmService:
@@ -1210,12 +1187,12 @@ class MailTmService:
 
 
 class EmailService:
-    """Unified API service selecting between Gmail IMAP and Mail.tm dynamically."""
+    """Unified API service selecting between Gmail RapidAPI and Mail.tm dynamically."""
     
     @staticmethod
     async def generate_email(user_id: int) -> Optional[str]:
         if GmailService.is_configured():
-            return GmailService.generate_email(user_id)
+            return await GmailService.generate_email(user_id)
         else:
             return await MailTmService.generate_email(user_id)
             
@@ -1402,8 +1379,10 @@ async def new_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 <b>Cost:</b> <code>{EMAIL_COST} credit</code>\n"
     )
     
-    if not GmailService.is_configured():
-        body += "💡 <i>Pro Tip: Add GMAIL_USER & GMAIL_APP_PASSWORD to Render variables to generate real <b>@gmail.com</b> addresses!</i>\n\n"
+    if not os.environ.get("RAPIDAPI_KEY"):
+        body += "💡 <i>Pro Tip: Configure your own <code>RAPIDAPI_KEY</code> on Render to customize temporary Gmail creation!</i>\n\n"
+    else:
+        body += "⚡️ <i>Powered by your custom Gmailnator RapidAPI subscription.</i>\n\n"
         
     body += "📥 <i>Tap the <b>INBOX</b> button below to check your mail!</i>"
     
