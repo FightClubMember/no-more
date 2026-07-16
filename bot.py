@@ -946,6 +946,42 @@ class UI:
             f"<b>╚═════════════════════════════════╝</b>"
         )
         return f"{header}\n\n{body}"
+
+    @staticmethod
+    def clean_html_to_text(html_content: str) -> str:
+        """Strip HTML tags and convert common styles/entities to clean plain text for Telegram."""
+        import re
+        if not html_content:
+            return ""
+            
+        # 1. Remove style and script sections
+        text = re.sub(r'(?is)<style[^>]*>.*?</style>', '', html_content)
+        text = re.sub(r'(?is)<script[^>]*>.*?</script>', '', text)
+        
+        # 2. Convert common block elements to newlines
+        text = re.sub(r'(?i)<br\s*/?>', '\n', text)
+        text = re.sub(r'(?i)</?p\b[^>]*>', '\n\n', text)
+        text = re.sub(r'(?i)</?div\b[^>]*>', '\n', text)
+        text = re.sub(r'(?i)</?tr\b[^>]*>', '\n', text)
+        text = re.sub(r'(?i)</?td\b[^>]*>', ' ', text)
+        
+        # 3. Strip all remaining HTML tags
+        text = re.sub(r'<[^>]+>', '', text)
+        
+        # 4. Decode HTML entities (e.g. &nbsp;, &amp;)
+        text = html.unescape(text)
+        
+        # 5. Clean up whitespace: compress multiple newlines/spaces
+        lines = [line.strip() for line in text.splitlines()]
+        cleaned_lines = []
+        for line in lines:
+            if line:
+                cleaned_lines.append(line)
+            elif not cleaned_lines or cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+                
+        text = "\n".join(cleaned_lines).strip()
+        return text
     
     @staticmethod
     def back_button(callback_data: str = "noop") -> InlineKeyboardMarkup:
@@ -1391,42 +1427,39 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def new_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /newemail command - generate a new temp email."""
-    user_id = update.effective_user.id
-    user = db.get_user(user_id)
-    
-    if not user:
-        await update.message.reply_text("⚠️ Please use /start first to register.", parse_mode=ParseMode.HTML)
-        return
-    
-    if user['is_banned']:
-        await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
-        return
-    
+async def _perform_email_generation(message_or_query, user_id: int, user: dict):
+    """Internal helper to execute the email generation process and deduct credits."""
     # Check credits
     if user['credits'] < EMAIL_COST:
-        await update.message.reply_text(
-            f"⚠️ <b>Not enough credits!</b> You need <code>{EMAIL_COST} credit</code>.\n👉 Use /daily or refer friends to earn more.",
-            parse_mode=ParseMode.HTML
-        )
+        msg_text = f"⚠️ <b>Not enough credits!</b> You need <code>{EMAIL_COST} credit</code>.\n👉 Use /daily or refer friends to earn more."
+        if hasattr(message_or_query, "reply_text"):
+            await message_or_query.reply_text(msg_text, parse_mode=ParseMode.HTML)
+        else:
+            await message_or_query.edit_message_text(UI.box("Error", msg_text), parse_mode=ParseMode.HTML)
         return
     
     # Deduct credits
     if not db.deduct_credits(user_id, EMAIL_COST):
-        await update.message.reply_text("⚠️ Transaction failed. Try again.", parse_mode=ParseMode.HTML)
+        msg_text = "⚠️ Transaction failed. Try again."
+        if hasattr(message_or_query, "reply_text"):
+            await message_or_query.reply_text(msg_text, parse_mode=ParseMode.HTML)
+        else:
+            await message_or_query.edit_message_text(UI.box("Error", msg_text), parse_mode=ParseMode.HTML)
         return
-    
+        
     # Generate email
-    status_msg = await update.message.reply_text("⚙️ <b>Generating your premium address...</b>", parse_mode=ParseMode.HTML)
-    
+    if hasattr(message_or_query, "reply_text"):
+        status_msg = await message_or_query.reply_text("⚙️ <b>Generating your premium address...</b>", parse_mode=ParseMode.HTML)
+    else:
+        status_msg = await message_or_query.edit_message_text("⚙️ <b>Generating your premium address...</b>", parse_mode=ParseMode.HTML)
+        
     email = await EmailService.generate_email(user_id)
     if not email:
         db._execute("UPDATE users SET credits = credits + ? WHERE user_id = ?", (EMAIL_COST, user_id))
         db.conn.commit()
         await status_msg.edit_text("❌ <b>Failed to generate email. Please try again later.</b>", parse_mode=ParseMode.HTML)
         return
-    
+        
     db.set_email(user_id, email)
     
     is_gmail = "@gmail.com" in email
@@ -1451,6 +1484,45 @@ async def new_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
         reply_markup=UI.get_reply_keyboard()
     )
+
+
+async def new_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /newemail command - generate a new temp email."""
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+    
+    if not user:
+        await update.message.reply_text("⚠️ Please use /start first to register.", parse_mode=ParseMode.HTML)
+        return
+    
+    if user['is_banned']:
+        await update.message.reply_text("⛔️ You are banned from using this bot.", parse_mode=ParseMode.HTML)
+        return
+        
+    # Check if they already have an email assigned
+    current_email = user.get('email', '')
+    if current_email:
+        body = (
+            f"📧 <b>You already have an active email address:</b>\n"
+            f"<code>{current_email}</code>\n\n"
+            f"⚠️ <i>Generating a new email address will permanently delete your current inbox history and cost <code>{EMAIL_COST} credit</code>.</i>\n\n"
+            f"<b>Do you want to generate a new address anyway?</b>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Yes, Generate New", callback_data="email_confirm"),
+                InlineKeyboardButton("❌ Keep Current Address", callback_data="email_keep")
+            ]
+        ])
+        await update.message.reply_text(
+            UI.box("Active Email Found", body),
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard
+        )
+        return
+        
+    # If no email, proceed to direct generation
+    await _perform_email_generation(update.message, user_id, user)
 
 
 async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1589,6 +1661,10 @@ async def read_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Mark as seen
     db.mark_message_seen(user_id, message_id, email)
     
+    # Clean HTML code to plain text if it contains HTML
+    if "<html" in content.lower() or "<div" in content.lower() or "<p" in content.lower():
+        content = UI.clean_html_to_text(content)
+        
     # Truncate if too long
     if len(content) > 3500:
         content = content[:3500] + "\n\n...(truncated)"
@@ -1909,6 +1985,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
     
+    # Email generation confirmation callbacks
+    elif data.startswith("email_"):
+        action = data.split("_")[1]
+        if action == "confirm":
+            await _perform_email_generation(query, user_id, user)
+        elif action == "keep":
+            email_addr = user.get('email', '')
+            body = (
+                f"📧 <b>Your Active Temporary Email:</b>\n"
+                f"<code>{email_addr}</code>\n\n"
+                f"📥 <i>Tap the <b>INBOX</b> button below to check your mail!</i>"
+            )
+            await query.edit_message_text(
+                UI.box("Email Kept", body),
+                parse_mode=ParseMode.HTML,
+                reply_markup=UI.get_reply_keyboard()
+            )
+        return
+        
     # Inbox pagination
     if data.startswith("inbox_"):
         parts = data.split("_")
