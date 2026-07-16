@@ -1482,7 +1482,9 @@ async def _perform_email_generation(message_or_query, user_id: int, user: dict):
     await status_msg.edit_text(
         UI.box("Email Generated", body),
         parse_mode=ParseMode.HTML,
-        reply_markup=UI.get_reply_keyboard()
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📥 Check Inbox", callback_data="inbox_0")]
+        ])
     )
 
 
