@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.tmp
+.env
+qr/
+sessions/
+golddrop_seen.json
+golddrop_rewards.txt
+golddrop_won_numbers.txt
+nomore/
